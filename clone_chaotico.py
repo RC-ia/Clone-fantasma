@@ -168,6 +168,8 @@ class ESN:
         # Readout
         self.W_out = np.zeros((out_dim, res_dim), dtype=np.float32)
         self.b_out = np.zeros((out_dim,), dtype=np.float32)
+        self.mean = None
+        self.std = None
 
     def _step(self, x_t, h):
         pre = self.W_in @ x_t + self.W @ h
@@ -184,11 +186,15 @@ class ESN:
             H_tilde = np.tanh(pre)
             H = (1 - self.leak) * H + self.leak * H_tilde
         return H
-    
+
     def fit(self, X_seq, Y_ids, num_classes):
         # Coleta estados do reservatório
         H = self.collect_states(X_seq)   # [N, R]
-        Hn = zscore(H)
+
+        # Calcula e armazena a normalização
+        self.mean = H.mean(axis=0, keepdims=True)
+        self.std = H.std(axis=0, keepdims=True)
+        Hn = (H - self.mean) / (self.std + 1e-8)
 
         # One-hot dos rótulos
         Y = np.zeros((len(Y_ids), num_classes), dtype=np.float32)
@@ -204,10 +210,13 @@ class ESN:
 
         self.W_out = W_out.T  # [C,R]
         self.b_out = (Y.mean(0) - (self.W_out @ Hn.mean(0))).astype(np.float32)
-    
+
     def predict_proba(self, X_seq):
+        if self.mean is None or self.std is None:
+            raise RuntimeError("O modelo deve ser treinado antes de prever.")
+
         H = self.collect_states(X_seq)
-        Hn = zscore(H)
+        Hn = (H - self.mean) / (self.std + 1e-8)
         logits = (self.W_out @ Hn.T).T + self.b_out
         logits = logits - logits.max(axis=1, keepdims=True)
         exp = np.exp(logits)
@@ -286,6 +295,7 @@ def visualizar_embeddings_ocr(palavras, dim=256, metodo="pca", n_most_common=100
 # ---------------- Main ----------------
 
 if __name__ == "__main__":
+    init_db()
     info = treinar_exemplo(limit=80000, res_dim=800, ocr_dim=256)
     print("📊 Acurácia de teste:", info["acc_teste"])
     print("🎯 Top-3 accuracy:", info["top3_acc"])
@@ -303,45 +313,25 @@ if __name__ == "__main__":
         if typ == "OCR":
             palavras_ocr.extend([w.lower() for w in re.findall(r"[a-zA-ZÀ-ÿ0-9]{3,}", det)])
     visualizar_embeddings_ocr(palavras_ocr, dim=256, metodo="pca", n_most_common=100)
-    
-    keyboard_listener.start()
-    mouse_listener.start()
-    threading.Thread(target=ocr_loop, daemon=True).start()
-    
-    # Mantenha rodando (ex.: input para pausar)
-    input("Pressione Enter para parar...")
+
+    # Para iniciar a coleta de dados, descomente a linha abaixo
+    # iniciar_modo_escuta()
 
 # ------------------Modo piloto automatico------------------
 
-def reproduzir_sequencia(esn, id2action, sequencia_inicial, num_passos=10):
-    X_seq = np.array([sequencia_inicial])  # Shape: [1, seq_len, in_dim]
-    for _ in range(num_passos):
-        proba = esn.predict_proba(X_seq)
-        acao_id = np.argmax(proba)
-        acao = id2action[acao_id]
-        print(f"Executando: {acao}")
-        if "key:" in acao:
-            pyautogui.press(acao.split(":")[1])  # Simula tecla
-        elif "click:" in acao:
-            pyautogui.click()  # Adapte com coords
-        time.sleep(0.1)  # Delay para evitar flood
-        # Atualize X_seq com nova ação (adapte features)
-
 #------------------Modo gamer------------------
 
-def capturar_ocr():
-    img = ImageGrab.grab(bbox=(0,0,1920,1080))  # Captura tela
-    texto = pytesseract.image_to_string(img)
-    return ocr_embedding(texto)
-
 # ---------------- Configuração do banco de dados ----------------
-conn = sqlite3.connect("modo_aprender.db")
-conn.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, timestamp TEXT, janela TEXT, tipo TEXT, detalhe TEXT)")
+
+def init_db():
+    """Cria a tabela de logs se ela não existir."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, timestamp TEXT, janela TEXT, tipo TEXT, detalhe TEXT)")
 
 def log_event(tipo, detalhe, janela="desconhecida"):
-    ts = time.isoformat(time.time())
-    conn.execute("INSERT INTO logs (timestamp, janela, tipo, detalhe) VALUES (?, ?, ?, ?)", (ts, janela, tipo, detalhe))
-    conn.commit()
+    ts = datetime.now().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO logs (timestamp, janela, tipo, detalhe) VALUES (?, ?, ?, ?)", (ts, janela, tipo, detalhe))
 
 def on_press(key):
     log_event("KeyPress", str(key).strip("'"))  # Ex.: 'a' em vez de "pressionado: 'a'"
@@ -351,21 +341,45 @@ def on_click(x, y, button, pressed):
         side = 'left' if button == mouse.Button.left else 'right' if button == mouse.Button.right else 'unk'
         log_event("Clique", f"{side} ({x}, {y})")
 
-keyboard_listener = keyboard.Listener(on_press=on_press)
-mouse_listener = mouse.Listener(on_click=on_click)
-
 def ocr_loop():
     while True:
-        texto = capturar_ocr()
-        log_event("OCR", texto)
+        try:
+            img = ImageGrab.grab(bbox=(0,0,1920,1080))
+            texto = pytesseract.image_to_string(img)
+            if texto.strip():
+                log_event("OCR", texto)
+        except Exception as e:
+            print(f"Erro no loop de OCR: {e}")
         time.sleep(5)
 
+def iniciar_modo_escuta():
+    """Inicializa e inicia os listeners de teclado, mouse e o loop de OCR."""
+    print("Iniciando modo de escuta. Pressione Enter nesta janela para parar.")
+
+    keyboard_listener = keyboard.Listener(on_press=on_press)
+    mouse_listener = mouse.Listener(on_click=on_click)
+
+    keyboard_listener.start()
+    mouse_listener.start()
+
+    ocr_thread = threading.Thread(target=ocr_loop, daemon=True)
+    ocr_thread.start()
+
+    input("Pressione Enter para parar...\n")
+
+    keyboard_listener.stop()
+    mouse_listener.stop()
+    print("Listeners parados.")
+
+
 def get_current_features(win2id, action2id, ocr_dim):  # Adicione isso
-    # Captura estado atual (adapte: pegue janela ativa com pygetwindow ou similar)
+    # --- ATENÇÃO: Esta função é um placeholder e não está funcional. ---
+    # Para funcionar, precisa de uma biblioteca como 'pygetwindow' para
+    # obter a janela ativa e o texto dela (via OCR ou APIs de acessibilidade).
     ts = datetime.now()
-    win = "current_window"  # Pegue real
-    typ = "unknown"
-    det = ""  # Ou capture OCR/mouse
+    win = "placeholder_window"  # Ex: gw.getActiveWindow().title
+    typ = "placeholder_type"    # O tipo de evento teria que ser determinado.
+    det = ""                    # O detalhe (texto de OCR, etc) teria que ser capturado.
     act = tokenizar_evento(typ, det)
     feat = []
     feat.extend(one_hot(win2id.get(win, len(win2id)), len(win2id) + 1))
@@ -376,19 +390,26 @@ def get_current_features(win2id, action2id, ocr_dim):  # Adicione isso
     return np.array(feat, dtype=np.float32)
 
 def reproduzir_sequencia(esn, id2action, sequencia_inicial, num_passos=10, win2id=None, action2id=None, ocr_dim=256):
+    # --- ATENÇÃO: O modo piloto automático é um protótipo e não está funcional. ---
+    # A função `get_current_features` precisaria ser implementada para capturar
+    # o estado real da tela e da janela para que o ciclo de previsão e ação funcione.
     X_seq = np.array([sequencia_inicial])  # [1, seq_len, in_dim]
     current_seq = list(sequencia_inicial)  # Lista para append/pop
     for _ in range(num_passos):
         proba = esn.predict_proba(X_seq)
         acao_id = np.argmax(proba[0])
         acao = id2action.get(acao_id, "other")
-        print(f"Executando: {acao}")
+        print(f"Executando ação prevista: {acao}")
         if "key:" in acao:
             pyautogui.press(acao.split(":")[1])
         elif "click:" in acao:
-            pyautogui.click()  # Adicione coords via mouse_features
+            # Para um clique funcional, as coordenadas precisariam ser extraídas
+            # do evento previsto e passadas para a função de clique.
+            pyautogui.click()
         time.sleep(0.1)
-        # Atualize com novo feature (baseado no estado pós-ação)
+
+        # A linha abaixo é a principal razão pela qual o piloto não funciona.
+        # `get_current_features` não captura o estado real do sistema.
         new_feat = get_current_features(win2id, action2id, ocr_dim)
         current_seq.append(new_feat)
         current_seq.pop(0)  # Manter seq_len
