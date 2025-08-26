@@ -5,7 +5,12 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-
+import pyautogui
+import time
+import pytesseract
+from PIL import ImageGrab
+from pynput import keyboard, mouse
+import threading
 # ---------------- Funções auxiliares ----------------
 
 DB_PATH = "modo_aprender.db"  # banco do seu coletor
@@ -179,28 +184,27 @@ class ESN:
             H_tilde = np.tanh(pre)
             H = (1 - self.leak) * H + self.leak * H_tilde
         return H
-
+    
     def fit(self, X_seq, Y_ids, num_classes):
-    # Coleta estados do reservatório
-    H = self.collect_states(X_seq)   # [N, R]
-    Hn = zscore(H)
+        # Coleta estados do reservatório
+        H = self.collect_states(X_seq)   # [N, R]
+        Hn = zscore(H)
 
-    # One-hot dos rótulos
-    Y = np.zeros((len(Y_ids), num_classes), dtype=np.float32)
-    Y[np.arange(len(Y_ids)), Y_ids] = 1.0  # [N, C]
+        # One-hot dos rótulos
+        Y = np.zeros((len(Y_ids), num_classes), dtype=np.float32)
+        Y[np.arange(len(Y_ids)), Y_ids] = 1.0  # [N, C]
 
-    lam = self.ridge
+        lam = self.ridge
 
-    # Ridge regression no espaço do reservatório
-    A = Hn.T @ Hn + lam * np.eye(Hn.shape[1], dtype=np.float32)  # [R,R]
-    B = Hn.T @ Y  # [R,C]
+        # Ridge regression no espaço do reservatório
+        A = Hn.T @ Hn + lam * np.eye(Hn.shape[1], dtype=np.float32)  # [R,R]
+        B = Hn.T @ Y  # [R,C]
 
-    W_out = np.linalg.solve(A, B)  # [R,C]
+        W_out = np.linalg.solve(A, B)  # [R,C]
 
-    self.W_out = W_out.T  # [C,R]
-    self.b_out = (Y.mean(0) - (self.W_out @ Hn.mean(0))).astype(np.float32)
-
-
+        self.W_out = W_out.T  # [C,R]
+        self.b_out = (Y.mean(0) - (self.W_out @ Hn.mean(0))).astype(np.float32)
+    
     def predict_proba(self, X_seq):
         H = self.collect_states(X_seq)
         Hn = zscore(H)
@@ -299,3 +303,93 @@ if __name__ == "__main__":
         if typ == "OCR":
             palavras_ocr.extend([w.lower() for w in re.findall(r"[a-zA-ZÀ-ÿ0-9]{3,}", det)])
     visualizar_embeddings_ocr(palavras_ocr, dim=256, metodo="pca", n_most_common=100)
+    
+    keyboard_listener.start()
+    mouse_listener.start()
+    threading.Thread(target=ocr_loop, daemon=True).start()
+    
+    # Mantenha rodando (ex.: input para pausar)
+    input("Pressione Enter para parar...")
+
+# ------------------Modo piloto automatico------------------
+
+def reproduzir_sequencia(esn, id2action, sequencia_inicial, num_passos=10):
+    X_seq = np.array([sequencia_inicial])  # Shape: [1, seq_len, in_dim]
+    for _ in range(num_passos):
+        proba = esn.predict_proba(X_seq)
+        acao_id = np.argmax(proba)
+        acao = id2action[acao_id]
+        print(f"Executando: {acao}")
+        if "key:" in acao:
+            pyautogui.press(acao.split(":")[1])  # Simula tecla
+        elif "click:" in acao:
+            pyautogui.click()  # Adapte com coords
+        time.sleep(0.1)  # Delay para evitar flood
+        # Atualize X_seq com nova ação (adapte features)
+
+#------------------Modo gamer------------------
+
+def capturar_ocr():
+    img = ImageGrab.grab(bbox=(0,0,1920,1080))  # Captura tela
+    texto = pytesseract.image_to_string(img)
+    return ocr_embedding(texto)
+
+# ---------------- Configuração do banco de dados ----------------
+conn = sqlite3.connect("modo_aprender.db")
+conn.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, timestamp TEXT, janela TEXT, tipo TEXT, detalhe TEXT)")
+
+def log_event(tipo, detalhe, janela="desconhecida"):
+    ts = time.isoformat(time.time())
+    conn.execute("INSERT INTO logs (timestamp, janela, tipo, detalhe) VALUES (?, ?, ?, ?)", (ts, janela, tipo, detalhe))
+    conn.commit()
+
+def on_press(key):
+    log_event("KeyPress", str(key).strip("'"))  # Ex.: 'a' em vez de "pressionado: 'a'"
+
+def on_click(x, y, button, pressed):
+    if pressed:
+        side = 'left' if button == mouse.Button.left else 'right' if button == mouse.Button.right else 'unk'
+        log_event("Clique", f"{side} ({x}, {y})")
+
+keyboard_listener = keyboard.Listener(on_press=on_press)
+mouse_listener = mouse.Listener(on_click=on_click)
+
+def ocr_loop():
+    while True:
+        texto = capturar_ocr()
+        log_event("OCR", texto)
+        time.sleep(5)
+
+def get_current_features(win2id, action2id, ocr_dim):  # Adicione isso
+    # Captura estado atual (adapte: pegue janela ativa com pygetwindow ou similar)
+    ts = datetime.now()
+    win = "current_window"  # Pegue real
+    typ = "unknown"
+    det = ""  # Ou capture OCR/mouse
+    act = tokenizar_evento(typ, det)
+    feat = []
+    feat.extend(one_hot(win2id.get(win, len(win2id)), len(win2id) + 1))
+    feat.extend(one_hot(action2id.get(act, len(action2id)), len(action2id) + 1))
+    feat.extend(tempo_features(ts))
+    feat.extend(mouse_features(det) if typ == "Clique" else [0, 0])
+    feat.extend(ocr_embedding(det, ocr_dim) if typ == "OCR" else np.zeros(ocr_dim))
+    return np.array(feat, dtype=np.float32)
+
+def reproduzir_sequencia(esn, id2action, sequencia_inicial, num_passos=10, win2id=None, action2id=None, ocr_dim=256):
+    X_seq = np.array([sequencia_inicial])  # [1, seq_len, in_dim]
+    current_seq = list(sequencia_inicial)  # Lista para append/pop
+    for _ in range(num_passos):
+        proba = esn.predict_proba(X_seq)
+        acao_id = np.argmax(proba[0])
+        acao = id2action.get(acao_id, "other")
+        print(f"Executando: {acao}")
+        if "key:" in acao:
+            pyautogui.press(acao.split(":")[1])
+        elif "click:" in acao:
+            pyautogui.click()  # Adicione coords via mouse_features
+        time.sleep(0.1)
+        # Atualize com novo feature (baseado no estado pós-ação)
+        new_feat = get_current_features(win2id, action2id, ocr_dim)
+        current_seq.append(new_feat)
+        current_seq.pop(0)  # Manter seq_len
+        X_seq = np.array([current_seq])
